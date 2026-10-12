@@ -526,6 +526,10 @@ class B2Session:
         name = self.cache.get_bucket_name_or_none_from_bucket_id(bucket_id)
         if name is None:
             return None  # not from the cache (or DummyCache): nothing to fix
+        if not self._key_can_list_buckets():
+            # evicting would leave a key that cannot resolve names unable to use the bucket at all
+            # (Unauthorized instead of BucketIdNotFound next time): keep legacy behaviour instead
+            return None
         self.cache.remove_bucket_name(name)
         exc.stale_bucket_name = name  # additive attribute; callers may use it for a better message
         exc.stale_bucket_key_bound = bucket_id in self._key_restricted_bucket_ids()
@@ -553,6 +557,10 @@ class B2Session:
             if fresh_id is None:
                 return False  # deleted for good
             self.cache.save_bucket(_NameId(name, fresh_id))
+            # keep the map transitive: ids that already pointed at the now-stale id follow too
+            for old_id, current in list(self._bucket_id_remap.items()):
+                if current == exc.bucket_id:
+                    self._bucket_id_remap[old_id] = fresh_id
             self._bucket_id_remap[exc.bucket_id] = fresh_id
             logger.info('bucket %r was recreated (%s -> %s); retrying once', name, exc.bucket_id,
                         fresh_id)
@@ -563,6 +571,13 @@ class B2Session:
         args = tuple(remap.get(a, a) if isinstance(a, str) else a for a in args)
         kwargs = {k: remap.get(v, v) if isinstance(v, str) else v for k, v in kwargs.items()}
         return args, kwargs
+
+    def _key_can_list_buckets(self) -> bool:
+        try:
+            capabilities = (self.account_info.get_allowed() or {}).get('capabilities')
+        except MissingAccountData:
+            return False
+        return capabilities is None or 'listBuckets' in capabilities
 
     def _key_restricted_bucket_ids(self) -> set:
         try:

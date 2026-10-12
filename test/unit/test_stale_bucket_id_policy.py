@@ -193,3 +193,47 @@ def test_invalid_policy_rejected():
         pytest.skip('legacy apiver does not expose the kwarg')
     with pytest.raises(ValueError):
         B2Api(stale_bucket_id_policy='sometimes')
+
+
+def test_heal_is_transitive_for_long_running_process(tmp_path):
+    """Same Bucket object, bucket recreated twice elsewhere: both recreations heal."""
+    cloud = Cloud()
+    other = cloud.api(tmp_path / 'o.sqlite')
+    api = cloud.api(tmp_path / 'l.sqlite', policy='heal')
+    api.create_bucket('foo', 'allPrivate')
+    bucket = api.get_bucket_by_name('foo')
+    for _ in range(2):
+        other.delete_bucket(other.get_bucket_by_name('foo'))
+        other.create_bucket('foo', 'allPrivate')
+        cloud.calls.clear()
+        assert list(bucket.ls()) == []
+        assert list(bucket.ls()) == []
+        assert cloud.calls == Counter({'list_file_names': 3, 'list_buckets': 1})
+
+
+@pytest.mark.parametrize('policy', ['evict', 'heal'])
+def test_key_without_list_buckets_keeps_legacy_behaviour(tmp_path, policy):
+    cloud = Cloud()
+    admin = cloud.api(tmp_path / 'a.sqlite')
+    other = cloud.api(tmp_path / 'o.sqlite')
+    admin.create_bucket('foo', 'allPrivate')
+    caps = ['listFiles', 'readFiles', 'writeBuckets', 'writeFiles']
+    try:
+        key = admin.create_key(caps, 'nolist')
+    except TypeError:
+        key = admin.create_key(caps, 'nolist')
+    key_id, secret = (key['applicationKeyId'], key['applicationKey']) if isinstance(key, dict) else (
+        key.id_, key.application_key)
+    info = SqliteAccountInfo(file_name=str(tmp_path / 'k.sqlite'))
+    api = B2Api(info, cache=AuthInfoCache(info),
+                api_config=B2HttpApiConfig(_raw_api_class=lambda *a, **k: cloud.sim))
+    api.session.stale_bucket_id_policy = policy
+    api.authorize_account(application_key_id=key_id, application_key=secret, realm='production')
+    api.cache.save_bucket(admin.get_bucket_by_name('foo'))  # cached id, as after an earlier lookup
+    other.delete_bucket(other.get_bucket_by_name('foo'))
+    other.create_bucket('foo', 'allPrivate')
+    cloud.calls.clear()
+    for _ in range(2):  # exactly legacy: BucketIdNotFound both times, no eviction, no lookups
+        with pytest.raises(BucketIdNotFound):
+            list(api.get_bucket_by_name('foo').ls())
+    assert cloud.calls == Counter({'list_file_names': 2})
