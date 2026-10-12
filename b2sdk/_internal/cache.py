@@ -48,6 +48,13 @@ class AbstractCache(metaclass=ABCMeta):
     def set_bucket_name_cache(self, buckets):
         pass
 
+    def remove_bucket_name(self, bucket_name):
+        """
+        Forget the cached id for ``bucket_name``.
+
+        Deliberately not abstract: custom caches written before this method existed keep working.
+        """
+
     def _name_id_iterator(self, buckets):
         return ((bucket.name, bucket.id_) for bucket in buckets)
 
@@ -103,6 +110,9 @@ class InMemoryCache(AbstractCache):
     def save_bucket(self, bucket):
         self.name_id_map[bucket.name] = bucket.id_
 
+    def remove_bucket_name(self, bucket_name):
+        self.name_id_map.pop(bucket_name, None)
+
     def set_bucket_name_cache(self, buckets):
         self.name_id_map = dict(self._name_id_iterator(buckets))
 
@@ -129,6 +139,9 @@ class AuthInfoCache(AbstractCache):
 
     def save_bucket(self, bucket):
         self.info.save_bucket(bucket)
+
+    def remove_bucket_name(self, bucket_name):
+        self.info.remove_bucket_name(bucket_name)
 
     def set_bucket_name_cache(self, buckets):
         self.info.refresh_entire_bucket_name_cache(self._name_id_iterator(buckets))

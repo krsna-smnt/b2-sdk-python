@@ -190,7 +190,13 @@ class B2Session:
         return self._wrap_default_token(self.raw_api.delete_key, application_key_id)
 
     def delete_bucket(self, account_id, bucket_id):
-        return self._wrap_default_token(self.raw_api.delete_bucket, account_id, bucket_id)
+        response = self._wrap_default_token(self.raw_api.delete_bucket, account_id, bucket_id)
+        # Forget the deleted bucket's name so a later recreate is resolved fresh (#567). Done here,
+        # not in B2Api, so every apiver gets it (v0 overrides B2Api.delete_bucket). Local write only.
+        name = self.cache.get_bucket_name_or_none_from_bucket_id(bucket_id)
+        if name is not None:
+            self.cache.remove_bucket_name(name)
+        return response
 
     def delete_file_version(self, file_id, file_name, bypass_governance: bool = False):
         return self._wrap_default_token(

@@ -667,7 +667,12 @@ class SqliteAccountInfo(UrlPoolAccountInfo):
 
     def save_bucket(self, bucket):
         with self._get_connection() as conn:
-            conn.execute('DELETE FROM bucket WHERE bucket_id = ?;', (bucket.id_,))
+            # One row per name: also drop a row holding this name under an older id, otherwise a
+            # delete+recreate leaves two rows and lookups keep returning the dead id (#567).
+            conn.execute(
+                'DELETE FROM bucket WHERE bucket_id = ? OR bucket_name = ?;',
+                (bucket.id_, bucket.name),
+            )
             conn.execute(
                 'INSERT INTO bucket (bucket_id, bucket_name) VALUES (?, ?);',
                 (bucket.id_, bucket.name),
