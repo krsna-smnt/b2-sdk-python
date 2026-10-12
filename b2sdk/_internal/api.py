@@ -40,7 +40,7 @@ from .progress import AbstractProgressListener
 from .raw_api import API_VERSION as RAW_API_VERSION
 from .raw_api import LifecycleRule
 from .replication.setting import ReplicationConfiguration
-from .session import B2Session
+from .session import STALE_BUCKET_ID_POLICIES, B2Session
 from .transfer import (
     CopyManager,
     DownloadManager,
@@ -143,6 +143,7 @@ class B2Api(metaclass=B2TraceMeta):
         save_to_buffer_size: int | None = None,
         check_download_hash: bool = True,
         max_download_streams_per_file: int | None = None,
+        stale_bucket_id_policy: str = 'raise',
     ):
         """
         Initialize the API using the given account info.
@@ -160,10 +161,20 @@ class B2Api(metaclass=B2TraceMeta):
         :param save_to_buffer_size: buffer size to use when writing files using DownloadedFile.save_to
         :param check_download_hash: whether to check hash of downloaded files. Can be disabled for files with internal checksums, for example, or to forcefully retrieve objects with corrupted payload or hash value
         :param max_download_streams_per_file: number of streams for parallel download manager
+        :param stale_bucket_id_policy: what to do when the server rejects a bucket id taken from the
+                      name->id cache (the bucket was deleted, maybe recreated under the same name):
+                      ``'raise'`` (default) legacy behaviour; ``'evict'`` also drop the stale cache
+                      entry so the next lookup by name goes to the server (no extra API call);
+                      ``'heal'`` evict, look the name up once and retry the call once against the
+                      bucket now holding the name (never for delete_bucket). The original exception
+                      is always what propagates; evict/heal add ``stale_bucket_name`` to it.
         """
+        if stale_bucket_id_policy not in STALE_BUCKET_ID_POLICIES:
+            raise ValueError(f'stale_bucket_id_policy must be one of {STALE_BUCKET_ID_POLICIES}')
         self.session = self.SESSION_CLASS(
             account_info=account_info, cache=cache, api_config=api_config
         )
+        self.session.stale_bucket_id_policy = stale_bucket_id_policy
         self.api_config = api_config
         self.file_version_factory = self.FILE_VERSION_FACTORY_CLASS(self)
         self.download_version_factory = self.DOWNLOAD_VERSION_FACTORY_CLASS(self)

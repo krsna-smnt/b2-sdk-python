@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import logging
+import threading
 from enum import Enum, unique
 from functools import partial
 from typing import Any
@@ -21,12 +22,24 @@ from b2sdk._internal.api_config import DEFAULT_HTTP_API_CONFIG, B2HttpApiConfig
 from b2sdk._internal.b2http import B2Http
 from b2sdk._internal.cache import AbstractCache, AuthInfoCache, DummyCache
 from b2sdk._internal.encryption.setting import EncryptionSetting
-from b2sdk._internal.exception import InvalidAuthToken, Unauthorized
+from b2sdk._internal.exception import B2Error, BucketIdNotFound, InvalidAuthToken, Unauthorized
 from b2sdk._internal.file_lock import BucketRetentionSetting, FileRetentionSetting, LegalHold
 from b2sdk._internal.raw_api import ALL_CAPABILITIES, REALM_URLS, LifecycleRule
 from b2sdk._internal.replication.setting import ReplicationConfiguration
 
 logger = logging.getLogger(__name__)
+
+# What to do when the server rejects a bucket id that came from the local name->id cache (#567)
+STALE_BUCKET_ID_POLICIES = ('raise', 'evict', 'heal')
+
+
+class _NameId:
+    """Minimal (name, id_) pair accepted by AbstractCache.save_bucket."""
+
+    __slots__ = ('name', 'id_')
+
+    def __init__(self, name, id_):
+        self.name, self.id_ = name, id_
 
 
 @unique
@@ -88,6 +101,10 @@ class B2Session:
             TokenType.UPLOAD_SMALL: self._upload_small,
             TokenType.UPLOAD_PART: self._upload_part,
         }
+        # 'raise' (default) = legacy behaviour, untouched. See B2Api(stale_bucket_id_policy=...).
+        self.stale_bucket_id_policy = 'raise'
+        self._bucket_id_remap: dict[str, str] = {}  # stale id -> current id, only after a heal
+        self._heal_lock = threading.Lock()
 
     def authorize_automatically(self):
         """
@@ -190,7 +207,11 @@ class B2Session:
         return self._wrap_default_token(self.raw_api.delete_key, application_key_id)
 
     def delete_bucket(self, account_id, bucket_id):
-        response = self._wrap_default_token(self.raw_api.delete_bucket, account_id, bucket_id)
+        # allow_heal=False: a stale id must never be retargeted to a *different* bucket that now
+        # holds the name. Explicit flag (not method comparison) so wrappers cannot defeat it.
+        response = self._call(
+            self.raw_api.delete_bucket, TokenType.API, (account_id, bucket_id), {}, allow_heal=False
+        )
         # Forget the deleted bucket's name so a later recreate is resolved fresh (#567). Done here,
         # not in B2Api, so every apiver gets it (v0 overrides B2Api.delete_bucket). Local write only.
         name = self.cache.get_bucket_name_or_none_from_bucket_id(bucket_id)
@@ -473,10 +494,85 @@ class B2Session:
         return self._wrap_token(raw_api_method, TokenType.API, *args, **kwargs)
 
     def _wrap_token(self, raw_api_method, token_type, *args, **kwargs):
-        callback = self._token_callbacks[token_type]
-        partial_callback = partial(callback, raw_api_method, *args, **kwargs)
+        return self._call(raw_api_method, token_type, args, kwargs, allow_heal=True)
 
-        return self._execute_with_auth_retry(partial_callback)
+    def _call(self, raw_api_method, token_type, args, kwargs, allow_heal: bool):
+        callback = self._token_callbacks[token_type]
+        if self._bucket_id_remap and allow_heal:
+            args, kwargs = self._apply_bucket_id_remap(args, kwargs)
+        try:
+            return self._execute_with_auth_retry(partial(callback, raw_api_method, *args, **kwargs))
+        except BucketIdNotFound as exc:
+            if self.stale_bucket_id_policy == 'raise':
+                raise  # legacy behaviour, byte for byte
+            name = self._evict_stale_bucket_id(exc, args, kwargs)
+            if name is None or not allow_heal or not self._heal(exc, name):
+                raise  # the ORIGINAL exception object: type and message unchanged
+        args, kwargs = self._apply_bucket_id_remap(args, kwargs)
+        try:  # healed: retry exactly once against the bucket that now holds the name
+            return self._execute_with_auth_retry(partial(callback, raw_api_method, *args, **kwargs))
+        except BucketIdNotFound as exc:
+            self._evict_stale_bucket_id(exc, args, kwargs)
+            raise
+
+    def _evict_stale_bucket_id(self, exc, args, kwargs) -> str | None:
+        """
+        If the rejected id was one we sent and it came from the name->id cache: drop that entry
+        (local write, no API call) and annotate the original exception with the bucket name.
+        """
+        bucket_id = getattr(exc, 'bucket_id', None)
+        if not bucket_id or (bucket_id not in args and bucket_id not in kwargs.values()):
+            return None
+        name = self.cache.get_bucket_name_or_none_from_bucket_id(bucket_id)
+        if name is None:
+            return None  # not from the cache (or DummyCache): nothing to fix
+        self.cache.remove_bucket_name(name)
+        exc.stale_bucket_name = name  # additive attribute; callers may use it for a better message
+        exc.stale_bucket_key_bound = bucket_id in self._key_restricted_bucket_ids()
+        return name
+
+    def _heal(self, exc, name) -> bool:
+        """
+        policy 'heal' only: one b2_list_buckets(bucketName=name) to find the bucket that now holds
+        the name. False (caller re-raises the original error) if the key itself is bound to the
+        deleted bucket, the lookup fails, or the bucket is gone for good.
+        """
+        if self.stale_bucket_id_policy != 'heal' or exc.stale_bucket_key_bound:
+            return False
+        with self._heal_lock:
+            if exc.bucket_id in self._bucket_id_remap:
+                return True  # healed by another thread meanwhile
+            try:
+                response = self.list_buckets(self.account_info.get_account_id(), bucket_name=name)
+            except B2Error:
+                logger.debug('lookup of %r failed while healing', name, exc_info=True)
+                return False
+            fresh_id = next(
+                (b['bucketId'] for b in response['buckets'] if b['bucketName'] == name), None
+            )
+            if fresh_id is None:
+                return False  # deleted for good
+            self.cache.save_bucket(_NameId(name, fresh_id))
+            self._bucket_id_remap[exc.bucket_id] = fresh_id
+            logger.info('bucket %r was recreated (%s -> %s); retrying once', name, exc.bucket_id,
+                        fresh_id)
+            return True
+
+    def _apply_bucket_id_remap(self, args, kwargs):
+        remap = self._bucket_id_remap
+        args = tuple(remap.get(a, a) if isinstance(a, str) else a for a in args)
+        kwargs = {k: remap.get(v, v) if isinstance(v, str) else v for k, v in kwargs.items()}
+        return args, kwargs
+
+    def _key_restricted_bucket_ids(self) -> set:
+        try:
+            allowed = self.account_info.get_allowed() or {}
+        except MissingAccountData:
+            return set()
+        ids = {b.get('id') for b in allowed.get('buckets') or []}
+        ids.add(allowed.get('bucketId'))  # legacy single-bucket format (apiver <= v2)
+        ids.discard(None)
+        return ids
 
     def _api_token_callback(self, raw_api_method, *args, **kwargs):
         api_url = self.account_info.get_api_url()
