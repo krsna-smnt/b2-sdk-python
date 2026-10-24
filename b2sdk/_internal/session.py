@@ -105,6 +105,7 @@ class B2Session:
         self.stale_bucket_id_policy = 'raise'
         self._bucket_id_remap: dict[str, str] = {}  # stale id -> current id, only after a heal
         self._heal_lock = threading.Lock()
+        self._no_heal = threading.local()  # set by delete_bucket; read only on the error path
 
     def authorize_automatically(self):
         """
@@ -207,11 +208,14 @@ class B2Session:
         return self._wrap_default_token(self.raw_api.delete_key, application_key_id)
 
     def delete_bucket(self, account_id, bucket_id):
-        # allow_heal=False: a stale id must never be retargeted to a *different* bucket that now
-        # holds the name. Explicit flag (not method comparison) so wrappers cannot defeat it.
-        response = self._call(
-            self.raw_api.delete_bucket, TokenType.API, (account_id, bucket_id), {}, allow_heal=False
-        )
+        # A stale id must never be retargeted to a *different* bucket that now holds the name, so
+        # healing is switched off for this call. A flag (not a method comparison) so wrappers
+        # cannot defeat it; it is only read on the error path, so the normal path is unchanged.
+        self._no_heal.active = True
+        try:
+            response = self._wrap_default_token(self.raw_api.delete_bucket, account_id, bucket_id)
+        finally:
+            self._no_heal.active = False
         # Forget the deleted bucket's name so a later recreate is resolved fresh (#567). Done here,
         # not in B2Api, so every apiver gets it (v0 overrides B2Api.delete_bucket). Local write only.
         name = self.cache.get_bucket_name_or_none_from_bucket_id(bucket_id)
@@ -494,22 +498,32 @@ class B2Session:
         return self._wrap_token(raw_api_method, TokenType.API, *args, **kwargs)
 
     def _wrap_token(self, raw_api_method, token_type, *args, **kwargs):
-        return self._call(raw_api_method, token_type, args, kwargs, allow_heal=True)
-
-    def _call(self, raw_api_method, token_type, args, kwargs, allow_heal: bool):
         callback = self._token_callbacks[token_type]
-        if self._bucket_id_remap and allow_heal:
+        if self._bucket_id_remap and not self._healing_disabled():  # empty unless a heal happened
             args, kwargs = self._apply_bucket_id_remap(args, kwargs)
+        partial_callback = partial(callback, raw_api_method, *args, **kwargs)
+
         try:
-            return self._execute_with_auth_retry(partial(callback, raw_api_method, *args, **kwargs))
+            return self._execute_with_auth_retry(partial_callback)
         except BucketIdNotFound as exc:
-            if self.stale_bucket_id_policy == 'raise':
-                raise  # legacy behaviour, byte for byte
-            name = self._evict_stale_bucket_id(exc, args, kwargs)
-            if name is None or not allow_heal or not self._heal(exc, name):
+            # everything below runs only after the server rejected a bucket id (#567)
+            if self.stale_bucket_id_policy == 'raise' or not self._prepare_retry(exc, args, kwargs):
                 raise  # the ORIGINAL exception object: type and message unchanged
+        return self._retry_once_after_heal(callback, raw_api_method, args, kwargs)
+
+    def _healing_disabled(self) -> bool:
+        return getattr(self._no_heal, 'active', False)
+
+    def _prepare_retry(self, exc, args, kwargs) -> bool:
+        """Policy evict/heal: evict the stale entry; for heal, also find the current id."""
+        name = self._evict_stale_bucket_id(exc, args, kwargs)
+        if name is None or self._healing_disabled():
+            return False
+        return self._heal(exc, name)
+
+    def _retry_once_after_heal(self, callback, raw_api_method, args, kwargs):
         args, kwargs = self._apply_bucket_id_remap(args, kwargs)
-        try:  # healed: retry exactly once against the bucket that now holds the name
+        try:  # exactly one retry, against the bucket that now holds the name
             return self._execute_with_auth_retry(partial(callback, raw_api_method, *args, **kwargs))
         except BucketIdNotFound as exc:
             self._evict_stale_bucket_id(exc, args, kwargs)
