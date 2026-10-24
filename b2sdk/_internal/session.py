@@ -499,8 +499,6 @@ class B2Session:
 
     def _wrap_token(self, raw_api_method, token_type, *args, **kwargs):
         callback = self._token_callbacks[token_type]
-        if self._bucket_id_remap and not self._healing_disabled():  # empty unless a heal happened
-            args, kwargs = self._apply_bucket_id_remap(args, kwargs)
         partial_callback = partial(callback, raw_api_method, *args, **kwargs)
 
         try:
@@ -510,6 +508,16 @@ class B2Session:
             if self.stale_bucket_id_policy == 'raise' or not self._prepare_retry(exc, args, kwargs):
                 raise  # the ORIGINAL exception object: type and message unchanged
         return self._retry_once_after_heal(callback, raw_api_method, args, kwargs)
+
+    def _wrap_token_remapped(self, raw_api_method, token_type, *args, **kwargs):
+        """
+        Installed on this session instance by the first successful heal (policy 'heal' only), so
+        that stale ids still held by long-lived Bucket objects go to the current bucket. Until a
+        heal happens, _wrap_token above is the only path and costs nothing extra.
+        """
+        if not self._healing_disabled():
+            args, kwargs = self._apply_bucket_id_remap(args, kwargs)
+        return type(self)._wrap_token(self, raw_api_method, token_type, *args, **kwargs)
 
     def _healing_disabled(self) -> bool:
         return getattr(self._no_heal, 'active', False)
@@ -576,6 +584,7 @@ class B2Session:
                 if current == exc.bucket_id:
                     self._bucket_id_remap[old_id] = fresh_id
             self._bucket_id_remap[exc.bucket_id] = fresh_id
+            self._wrap_token = self._wrap_token_remapped  # from now on, apply the remap
             logger.info('bucket %r was recreated (%s -> %s); retrying once', name, exc.bucket_id,
                         fresh_id)
             return True
